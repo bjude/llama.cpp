@@ -707,6 +707,13 @@ void ggml_backend_event_wait(ggml_backend_t backend, ggml_backend_event_t event)
     backend->iface.event_wait(backend, event);
 }
 
+bool ggml_backend_event_completed(ggml_backend_event_t event) {
+    GGML_ASSERT(event);
+
+    return event->device->iface.event_completed != NULL &&
+        event->device->iface.event_completed(event->device, event);
+}
+
 static void ggml_backend_graph_optimize(ggml_backend_t backend, struct ggml_cgraph * cgraph, struct ggml_backend_graph_optimize_params * params) {
     GGML_ASSERT(backend);
     if (backend->iface.graph_optimize != NULL) {

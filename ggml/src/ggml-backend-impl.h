@@ -216,6 +216,8 @@ extern "C" {
         ggml_backend_event_t (*event_new)         (ggml_backend_dev_t dev);
         void                 (*event_free)        (ggml_backend_dev_t dev, ggml_backend_event_t event);
         void                 (*event_synchronize) (ggml_backend_dev_t dev, ggml_backend_event_t event);
+        // (optional) non-blocking test of a recorded event, absent = capability false: ggml_backend_event_completed returns false
+        bool                 (*event_completed)   (ggml_backend_dev_t dev, ggml_backend_event_t event);
     };
 
     struct ggml_backend_device {

@@ -6,9 +6,19 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 #include <vector>
+
+#if defined(__x86_64__) || defined(__i386__) || (defined(_MSC_VER) && (defined(_M_AMD64) || defined(_M_IX86)))
+#include <immintrin.h>
+#define MOE_CACHE_PAUSE() _mm_pause()
+#else
+#define MOE_CACHE_PAUSE()
+#endif
 
 namespace {
 
@@ -182,6 +192,26 @@ static bool llama_moe_cache_is_host_weight(const ggml_tensor * t) {
         ggml_backend_buffer_is_host(t->buffer);
 }
 
+// env kill-switch that restores the blocking ids readback at runtime
+static bool llama_moe_cache_sync_legacy(void) {
+    static const bool res = []() {
+        const char * env = getenv("LLAMA_MOE_CACHE_SYNC_LEGACY");
+        return env != nullptr && strcmp(env, "0") != 0;
+    }();
+    return res;
+}
+
+// poll a completion event until observed: an event query, never a backend synchronize
+static void llama_moe_cache_wait_completed(ggml_backend_event_t evt) {
+    for (unsigned spins = 0; !ggml_backend_event_completed(evt);) {
+        if (++spins < 10000) {
+            MOE_CACHE_PAUSE();
+        } else {
+            std::this_thread::yield();
+        }
+    }
+}
+
 }
 
 struct llama_moe_cache::impl {
@@ -207,6 +237,12 @@ struct llama_moe_cache::impl {
         size_t host_bytes = 0;
         int32_t n_slots = 0;
         moe_cache_slru slru;
+
+        // syncless ids readback, events are null when the backend keeps the blocking drain
+        ggml_backend_buffer_ptr buf_ids;                // pinned staging of the selected expert ids
+        ggml_backend_event_t    evt_ids         = nullptr;  // recorded after the ids DtoH
+        ggml_backend_event_t    evt_map_upload  = nullptr;  // recorded after the slot map upload
+        bool map_upload_pending = false;                    // evt_map_upload is recorded and not yet observed complete
     };
 
     struct layer {
@@ -461,6 +497,56 @@ struct llama_moe_cache::impl {
             }
         }
 
+        if (!model.hparams.no_alloc && !llama_moe_cache_sync_legacy()) {
+            for (group & g : groups) {
+                if (g.n_slots == 0) {
+                    continue;
+                }
+                ggml_backend_dev_t dev = ggml_backend_get_device(devices[g.id].backend);
+                ggml_backend_buffer_type_t buft_pinned = ggml_backend_dev_host_buffer_type(dev);
+                if (buft_pinned != nullptr) {
+                    g.buf_ids.reset(ggml_backend_buft_alloc_buffer(buft_pinned, max_batch*n_expert_used*sizeof(int32_t)));
+                }
+                if (g.buf_ids == nullptr) {
+                    continue;
+                }
+                g.evt_ids        = ggml_backend_event_new(dev);
+                g.evt_map_upload = ggml_backend_event_new(dev);
+                // the event_completed slot is optional: after synchronize the recorded event is complete, a false test means capability false
+                bool completed_ok = g.evt_ids != nullptr && g.evt_map_upload != nullptr;
+                if (completed_ok) {
+                    ggml_backend_event_record(g.evt_ids, devices[g.id].backend);
+                    ggml_backend_event_synchronize(g.evt_ids);
+                    completed_ok = ggml_backend_event_completed(g.evt_ids);
+                }
+                if (!completed_ok) {
+                    ggml_backend_event_free(g.evt_ids);
+                    ggml_backend_event_free(g.evt_map_upload);
+                    g.evt_ids        = nullptr;
+                    g.evt_map_upload = nullptr;
+                    g.buf_ids.reset();
+                }
+            }
+        }
+
+        if (!model.hparams.no_alloc) {
+            if (llama_moe_cache_sync_legacy()) {
+                LLAMA_LOG_INFO("%s: syncless ids readback disabled by LLAMA_MOE_CACHE_SYNC_LEGACY\n", __func__);
+            } else {
+                size_t n_cached   = 0;
+                size_t n_syncless = 0;
+                for (const group & g : groups) {
+                    if (g.n_slots > 0) {
+                        n_cached++;
+                        if (g.evt_ids != nullptr) {
+                            n_syncless++;
+                        }
+                    }
+                }
+                LLAMA_LOG_INFO("%s: syncless ids readback enabled for %zu of %zu cached groups\n", __func__, n_syncless, n_cached);
+            }
+        }
+
         // as weights, the ops that read the banks run on the device and the slot maps are copied with the copy callback
         for (device & d : devices) {
             if (d.buf) {
@@ -490,6 +576,10 @@ struct llama_moe_cache::impl {
     }
 
     ~impl() {
+        for (group & g : groups) {
+            ggml_backend_event_free(g.evt_ids);
+            ggml_backend_event_free(g.evt_map_upload);
+        }
         log_stats();
     }
 
@@ -579,12 +669,33 @@ struct llama_moe_cache::impl {
         }
         GGML_ASSERT(ggml_is_contiguous(sel));
 
-        ids.resize(ggml_nelements(sel));
-        ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, ggml_nbytes(sel));
-        ggml_backend_synchronize(backend);
+        const size_t n_ids   = ggml_nelements(sel);
+        const size_t nbytes  = ggml_nbytes(sel);
+        const bool   syncless = g.evt_ids != nullptr;
+
+        const int32_t * ids_p;
+        if (syncless) {
+            // async DtoH into pinned memory; the wait is a poll on the event recorded after the copy
+            GGML_ASSERT(nbytes <= ggml_backend_buffer_get_size(g.buf_ids.get()));
+            int32_t * buf = (int32_t *) ggml_backend_buffer_get_base(g.buf_ids.get());
+            ggml_backend_tensor_get_async(backend, sel, buf, 0, nbytes);
+            ggml_backend_event_record(g.evt_ids, backend);
+            llama_moe_cache_wait_completed(g.evt_ids);
+            if (g.map_upload_pending) {
+                // the previous slot map upload must stop reading the host slot map before plan changes it
+                llama_moe_cache_wait_completed(g.evt_map_upload);
+                g.map_upload_pending = false;
+            }
+            ids_p = buf;
+        } else {
+            ids.resize(n_ids);
+            ggml_backend_tensor_get_async(backend, sel, ids.data(), 0, nbytes);
+            ggml_backend_synchronize(backend);
+            ids_p = ids.data();
+        }
 
         size_t n_hit = 0;
-        if (!g.slru.plan(il, ids.data(), ids.size(), fills, n_hit)) {
+        if (!g.slru.plan(il, ids_p, n_ids, fills, n_hit)) {
             GGML_ABORT("the MoE cache is too small for the experts selected in layer %d", il);
         }
 
@@ -605,13 +716,17 @@ struct llama_moe_cache::impl {
             }
         }
 
-        stats & st = ids.size() <= (size_t) 8*n_expert_used ? stats_small : stats_large;
+        stats & st = n_ids <= (size_t) 8*n_expert_used ? stats_small : stats_large;
         st.hits   += n_hit;
         st.misses += fills.size();
         st.bytes  += bytes;
 
-        // the next copy synchronizes the backend before it changes the slot map again
         ggml_backend_tensor_set_async(backend, dst, src->data, 0, ggml_nbytes(src));
+        if (syncless) {
+            // record the slot map upload completion, the next copy waits on this event before changing the host slot map
+            ggml_backend_event_record(g.evt_map_upload, backend);
+            g.map_upload_pending = true;
+        }
 
         return true;
     }

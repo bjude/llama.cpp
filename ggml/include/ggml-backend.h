@@ -128,6 +128,10 @@ extern "C" {
     GGML_API void                 ggml_backend_event_record(ggml_backend_event_t event, ggml_backend_t backend);
     GGML_API void                 ggml_backend_event_synchronize(ggml_backend_event_t event);
     GGML_API void                 ggml_backend_event_wait(ggml_backend_t backend, ggml_backend_event_t event);
+    // non-blocking test of a recorded event: true iff all operations enqueued before the matching ggml_backend_event_record have completed
+    // returns false when the event is not complete yet or the device does not implement the test, i.e. capability false
+    // behavior is undefined before the first ggml_backend_event_record
+    GGML_API bool ggml_backend_event_completed(ggml_backend_event_t event);
 
     //
     // Backend device

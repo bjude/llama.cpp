@@ -504,6 +504,7 @@ public:
     ggml_backend_event_t event_new(ggml_backend_dev_t dev);
     void event_free(ggml_backend_event_t event);
     void event_synchronize(ggml_backend_event_t event);
+    bool event_completed(ggml_backend_event_t event);
     void event_record(ggml_backend_event_t event);
     void synchronize();
     void busy_spin_acquire();
@@ -608,6 +609,11 @@ void rpc_dispatcher::event_free(ggml_backend_event_t event) {
 void rpc_dispatcher::event_synchronize(ggml_backend_event_t event) {
     rpc_event * ev = (rpc_event *)event->context;
     ev->sf.wait();
+}
+
+bool rpc_dispatcher::event_completed(ggml_backend_event_t event) {
+    rpc_event * ev = (rpc_event *)event->context;
+    return ev->sf.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
 }
 
 void rpc_dispatcher::event_record(ggml_backend_event_t event) {
@@ -2919,6 +2925,12 @@ static void ggml_backend_rpc_device_event_synchronize(ggml_backend_dev_t dev, gg
     dispatcher->event_synchronize(event);
 }
 
+static bool ggml_backend_rpc_device_event_completed(ggml_backend_dev_t dev, ggml_backend_event_t event) {
+    ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *)dev->context;
+    auto dispatcher = get_dispatcher(ctx->endpoint);
+    return dispatcher->event_completed(event);
+}
+
 static const struct ggml_backend_device_i ggml_backend_rpc_device_i = {
     /* .get_name             = */ ggml_backend_rpc_device_get_name,
     /* .get_description      = */ ggml_backend_rpc_device_get_description,
@@ -2935,7 +2947,7 @@ static const struct ggml_backend_device_i ggml_backend_rpc_device_i = {
     /* .event_new            = */ ggml_backend_rpc_device_event_new,
     /* .event_free           = */ ggml_backend_rpc_device_event_free,
     /* .event_synchronize    = */ ggml_backend_rpc_device_event_synchronize,
-    /* .event_completed      = */ NULL,
+    /* .event_completed      = */ ggml_backend_rpc_device_event_completed,
 };
 
 // backend reg interface
